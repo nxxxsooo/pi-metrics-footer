@@ -10,8 +10,8 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
  *
  * Replaces the pi TUI footer with a metrics line:
  *   - live tokens/sec while streaming (2s rolling window),
- *   - average tokens/sec for the last finished turn (8s fallback, works even when
- *     the provider does not stream deltas),
+ *   - average tokens/sec for the last finished turn, kept visible until the next
+ *     turn replaces it (also covers providers that do not stream deltas),
  *   - input/output/cache/cost tokens, context usage, and the current model.
  *
  * Model display names come from a default map and can be overridden per user via
@@ -59,11 +59,9 @@ function loadUserLabels(): Record<string, string> {
 const MODEL_LABELS: Record<string, string> = { ...DEFAULT_MODEL_LABELS, ...loadUserLabels() };
 
 const ROLLING_WINDOW_MS = 2000;
-const AVG_DISPLAY_MS = 8000;
 const tokenTimestamps: number[] = [];
 let messageStartTime = 0;
 let lastAvgTps: number | null = null;
-let lastAvgExpires = 0;
 
 function recordStreamToken(): void {
   const now = Date.now();
@@ -100,7 +98,6 @@ export default function (pi: ExtensionAPI) {
       if (event.message?.role === "assistant") {
         tokenTimestamps.length = 0;
         messageStartTime = Date.now();
-        lastAvgTps = null;
       }
     });
 
@@ -118,7 +115,6 @@ export default function (pi: ExtensionAPI) {
       const elapsed = Date.now() - messageStartTime;
       if (output > 0 && elapsed > 400) {
         lastAvgTps = output / (elapsed / 1000);
-        lastAvgExpires = Date.now() + AVG_DISPLAY_MS;
       }
     });
 
@@ -151,8 +147,7 @@ export default function (pi: ExtensionAPI) {
             : `${usage.percent.toFixed(1)}%/${formatTokens(usage.contextWindow)}`;
           const leftParts = [`↑${formatTokens(input)}`, `↓${formatTokens(output)}`];
           const live = computeStreamTps();
-          const avg = Date.now() < lastAvgExpires ? lastAvgTps : null;
-          const tps = live ?? avg;
+          const tps = live ?? lastAvgTps;
           if (tps !== null) {
             leftParts.unshift(`⚡ ${tps.toFixed(0)}t/s`);
           }
