@@ -13,6 +13,14 @@
     "tokens-per-second"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nxxxsooo/pi-metrics-footer.git"
+  },
+  "homepage": "https://github.com/nxxxsooo/pi-metrics-footer#readme",
+  "bugs": {
+    "url": "https://github.com/nxxxsooo/pi-metrics-footer/issues"
+  },
   "type": "module",
   "pi": {
     "extensions": [
