@@ -1,6 +1,6 @@
 {
   "name": "pi-metrics-footer",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Live model speed (tokens/s), token/cost/context stats, and configurable model labels in the pi TUI footer",
   "keywords": [
     "pi",
