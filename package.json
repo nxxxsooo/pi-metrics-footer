@@ -1,6 +1,6 @@
 {
   "name": "pi-metrics-footer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Live model speed (tokens/s), token/cost/context stats, and configurable model labels in the pi TUI footer",
   "keywords": [
     "pi",
@@ -15,7 +15,9 @@
   "license": "MIT",
   "type": "module",
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "files": [
     "extensions"
