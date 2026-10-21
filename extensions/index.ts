@@ -63,6 +63,13 @@ const tokenTimestamps: number[] = [];
 let messageStartTime = 0;
 let lastAvgTps: number | null = null;
 
+// Live context usage: pi's ctx.getContextUsage() only counts completed
+// messages, so it does not move while the assistant is streaming. Track the
+// pre-turn baseline and add streamed tokens for the in-flight message.
+let liveBaselineTokens: number | null = null;
+let liveContextWindow = 0;
+let liveStreamedTokens = 0;
+
 function recordStreamToken(): void {
   const now = Date.now();
   tokenTimestamps.push(now);
@@ -98,6 +105,10 @@ export default function (pi: ExtensionAPI) {
       if (event.message?.role === "assistant") {
         tokenTimestamps.length = 0;
         messageStartTime = Date.now();
+        const usage = ctx.getContextUsage();
+        liveContextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+        liveBaselineTokens = usage?.tokens ?? null;
+        liveStreamedTokens = 0;
       }
     });
 
@@ -105,6 +116,13 @@ export default function (pi: ExtensionAPI) {
       const ev = event.assistantMessageEvent;
       if (ev?.type === "text_delta" || ev?.type === "thinking_delta") {
         recordStreamToken();
+        liveStreamedTokens += 1;
+        // Prefer the provider's exact running output count when it is streamed
+        // live (e.g. Anthropic); otherwise the delta count is the estimate.
+        const out = ev.partial?.usage?.output;
+        if (typeof out === "number" && out > liveStreamedTokens) {
+          liveStreamedTokens = out;
+        }
       }
     });
 
@@ -116,6 +134,8 @@ export default function (pi: ExtensionAPI) {
       if (output > 0 && elapsed > 400) {
         lastAvgTps = output / (elapsed / 1000);
       }
+      liveBaselineTokens = null;
+      liveStreamedTokens = 0;
     });
 
     ctx.ui.setFooter((_tui, theme, footerData) => {
@@ -142,9 +162,16 @@ export default function (pi: ExtensionAPI) {
           }
 
           const usage = ctx.getContextUsage();
-          const context = usage?.percent == null
-            ? `?/${formatTokens(usage?.contextWindow ?? ctx.model?.contextWindow ?? 0)}`
-            : `${usage.percent.toFixed(1)}%/${formatTokens(usage.contextWindow)}`;
+          let context: string;
+          if (liveBaselineTokens !== null && liveStreamedTokens > 0 && liveContextWindow > 0) {
+            // In-flight estimate: completed context + tokens streamed so far.
+            const pct = ((liveBaselineTokens + liveStreamedTokens) / liveContextWindow) * 100;
+            context = `${pct.toFixed(1)}%/${formatTokens(liveContextWindow)}`;
+          } else {
+            context = usage?.percent == null
+              ? `?/${formatTokens(usage?.contextWindow ?? ctx.model?.contextWindow ?? 0)}`
+              : `${usage.percent.toFixed(1)}%/${formatTokens(usage.contextWindow)}`;
+          }
           const leftParts = [`↑${formatTokens(input)}`, `↓${formatTokens(output)}`];
           const live = computeStreamTps();
           const tps = live ?? lastAvgTps;
