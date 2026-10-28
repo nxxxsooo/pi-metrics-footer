@@ -6,7 +6,7 @@ Live model speed and usage metrics in the pi TUI footer: tokens/sec while stream
 
 - **Live tokens/sec** while the model streams (`⚡ 45t/s`), computed from a 2s rolling window of `text_delta` / `thinking_delta` events.
 - **Per-turn average** once a reply finishes: the last turn's average speed stays visible until the next turn replaces it — so a speed reading is always on screen, and it also works when the provider doesn't stream deltas.
-- **Token / cost / context line**: input, output, cache read/write, cost, and context usage, plus the current model (emoji label + thinking level).
+- **Token / cost / context line**: input, output, cache read/write, cost, and live context usage during streaming, plus the current model (emoji label + thinking level).
 - **Configurable model labels**: map `provider/model` IDs to your own display names.
 
 ## Install
@@ -48,7 +48,8 @@ Keys are `provider/model` exactly as shown by pi (e.g. from `/model`). User labe
 
 - **Live TPS** uses a 2s rolling window of streaming token events; it needs at least 2 samples within the window, so very short replies may not show it.
 - **Average TPS** = output tokens ÷ wall time of the last finished assistant message. It persists while idle and is replaced when the next turn produces a new reading.
-- Before the first reply of a session there is no reading yet, so nothing shows.
+- **Live context usage** adds a streamed-output estimate to the completed-message baseline, then returns to pi's reported context usage when the message finishes.
+- Before the first reply of a session there is no speed reading yet, so the speed indicator is hidden.
 
 ## License
 
