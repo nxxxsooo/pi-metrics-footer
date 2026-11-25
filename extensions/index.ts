@@ -44,11 +44,51 @@ const DEFAULT_MODEL_LABELS: Record<string, string> = {
   "qwen/qwen3-coder": "👾 Qwen Coder",
 };
 
+// Seed value only, and only for the character estimator. The ratio it stands for swings with what
+// is being written: measured on one local engine, 1.16 chars/token for a list of numbers, 2.6-2.8
+// for code and tables, 4.1-4.4 for prose. No pooled constant covers a 4x spread, which is why a
+// shipped value of 3.2 read 66-73 t/s on turns the engine itself reported at 50.2-51.1.
 const CHARS_PER_TOKEN_DEFAULT = 3.2;
-type FooterConfig = { labels: Record<string, string>; charsPerToken: number };
+// Seed for the delta estimator: one token per delta event, which is how local llama.cpp-class
+// servers actually stream (measured: 421 completion tokens in 371 content chunks, so ~1.13).
+const DEFAULT_TOKENS_PER_DELTA = 1.0;
+// Calibration guard rails. One turn is a noisy sample, so each turn nudges a ratio rather than
+// setting it, and a ratio outside these bounds is not a token ratio at all.
+const CALIBRATION_BLEND = 0.3;
+const CALIBRATION_MIN_TOKENS = 24;   // shorter than this, a turn is too noisy to learn from
+const CALIBRATION_MIN_CHARS = 120;
+const CALIBRATION_MIN_DELTAS = 8;
+const CPT_MIN = 0.8;
+const CPT_MAX = 12;
+const TPD_MIN = 0.05;
+const TPD_MAX = 20;
+// How fast the running error of each estimator forgets. The estimator with the smaller recent error
+// drives the live figure, so this also controls how quickly a session switches over.
+const ERR_BLEND = 0.4;
+// Switch only on a clear win. Two estimators within this factor of each other are equally bad, and
+// alternating between two bad estimators makes the figure jump around more than either alone.
+const ERR_HYSTERESIS = 1.25;
+
+type RateEstimator = "auto" | "deltas" | "chars";
+type FooterConfig = {
+  labels: Record<string, string>;
+  charsPerToken: number;
+  // True when charsPerToken came from the config file. A pinned value is respected and never
+  // recalibrated: an explicit number in the config means "use exactly this", and it also pins the
+  // estimator to characters, because that is the only knob that number turns.
+  charsPerTokenPinned: boolean;
+  // Which token estimator drives the live rate. "auto" scores both against the provider's real
+  // counts every turn and keeps the better one; see the estimator block below.
+  rateEstimator: RateEstimator;
+};
 
 function loadConfig(): FooterConfig {
-  const fallback = { labels: {} as Record<string, string>, charsPerToken: CHARS_PER_TOKEN_DEFAULT };
+  const fallback = {
+    labels: {} as Record<string, string>,
+    charsPerToken: CHARS_PER_TOKEN_DEFAULT,
+    charsPerTokenPinned: false,
+    rateEstimator: "auto" as RateEstimator,
+  };
   try {
     const raw = readFileSync(join(getAgentDir(), CONFIG_FILE), "utf8");
     const parsed: unknown = JSON.parse(raw);
@@ -57,12 +97,14 @@ function loadConfig(): FooterConfig {
     const labels = obj.modelLabels && typeof obj.modelLabels === "object"
       ? obj.modelLabels as Record<string, string>
       : fallback.labels;
-    // Only used when the provider does not stream a running output count. Fitted from real
-    // traffic, see CHARS_PER_TOKEN_DEFAULT.
-    const charsPerToken = typeof obj.charsPerToken === "number" && obj.charsPerToken > 1 && obj.charsPerToken < 12
-      ? obj.charsPerToken
-      : CHARS_PER_TOKEN_DEFAULT;
-    return { labels, charsPerToken };
+    // Only used when the provider does not stream a running output count. If it is present in the
+    // config it pins the divisor and calibration is switched off for the session.
+    const pinned = typeof obj.charsPerToken === "number" && obj.charsPerToken > 1 && obj.charsPerToken < 12;
+    const charsPerToken = pinned ? (obj.charsPerToken as number) : CHARS_PER_TOKEN_DEFAULT;
+    const rateEstimator: RateEstimator = obj.rateEstimator === "deltas" || obj.rateEstimator === "chars"
+      ? obj.rateEstimator
+      : "auto";
+    return { labels, charsPerToken, charsPerTokenPinned: pinned, rateEstimator };
   } catch {
     // missing or unreadable config is fine; defaults apply
     return fallback;
@@ -88,6 +130,9 @@ const MAX_RATE_ELAPSED_MS = 10000;
 // Four other local models fit 2.9-3.4, so the default is a pooled value and `charsPerToken`
 // in the config file overrides it. The previous assumption of 4.0 under-counted by 20.6%
 // in total and by 20.1% median per message on the same data.
+// [2026-11-23] That fit is sound as an average and misleading as a constant: it has a median
+// per-message error of 8.3% and a 90th-percentile error of 23%, which is precisely the difference
+// between a live figure that reads 50 and one that reads 66. Hence the per-turn calibration below.
 // The displayed rate is the mean of the last few window figures. A figure is taken at most
 // once per SMOOTH_INTERVAL_MS so those figures span time, not consecutive renders.
 const SMOOTH_SAMPLES = 5;
@@ -107,6 +152,55 @@ let streamingMessage = false;
 // span instead of the whole request.
 let firstDeltaAt = 0;
 let lastAvgTps: number | null = null;
+
+// Two token estimators run side by side, both calibrated against the provider's real output count at
+// message_end, and the one that has been predicting better drives the live rate figure:
+//
+//   deltas - tokens per delta event. Right when the provider streams one chunk per token, which local
+//            llama.cpp-class servers do, and it does not swing with content type.
+//   chars  - tokens per character. Needed when a delta is a fixed-size text flush rather than a token,
+//            which is how hosted providers typically stream; then delta counts say nothing about size.
+//
+// Both are accumulated every delta so each can be scored at message_end against the real count, which
+// is what makes the choice evidence rather than a guess about who the provider is.
+let msgChars = 0;
+let msgDeltas = 0;
+let estCharsTotal = 0;
+let estDeltaTotal = 0;
+// Fractional tokens not yet pushed into the rolling window, so a burst of small deltas does not all
+// round to zero and then one big delta does not look like a spike.
+let estCarry = 0;
+let charsPerToken = CONFIG.charsPerToken;
+let tokensPerDelta = DEFAULT_TOKENS_PER_DELTA;
+// Recent relative error of each estimator on this session; null until the first turn long enough to score.
+let errChars: number | null = null;
+let errDeltas: number | null = null;
+// True when the provider's own running output count drove the rate this message. Then there is
+// nothing to estimate and nothing to calibrate. Note that a provider which reports usage only in a
+// final chunk has NOT used its own counts for the rate, even though lastReportedOutput ends up set:
+// that is the common local-server case and it is exactly the one that needs calibrating.
+let usedReported = false;
+let useDeltas = CONFIG.charsPerTokenPinned ? false : CONFIG.rateEstimator !== "chars";
+
+// Blend `observed` into `current` by CALIBRATION_BLEND, clamped, ignoring a sample that is not a
+// believable ratio at all.
+function calibrateRatio(current: number, observed: number, min: number, max: number): number {
+  if (!Number.isFinite(observed) || observed < min || observed > max) return current;
+  const blended = current * (1 - CALIBRATION_BLEND) + observed * CALIBRATION_BLEND;
+  return Math.min(max, Math.max(min, blended));
+}
+
+// Relative error of one estimator's running total against the provider's real count.
+function scoreEstimator(estTotal: number, output: number): number {
+  if (output <= 0) return Number.POSITIVE_INFINITY;
+  return Math.abs(estTotal - output) / output;
+}
+
+// Exponential blend that does not get stuck at "no history yet".
+function blendError(prev: number | null, observed: number): number {
+  if (prev === null || !Number.isFinite(observed)) return observed;
+  return prev * (1 - ERR_BLEND) + observed * ERR_BLEND;
+}
 
 // The rolling window only fills while deltas stream. During a tool call (writing a file,
 // running a command) no deltas arrive, the window empties, and the footer silently falls
@@ -198,6 +292,12 @@ export default function (pi: ExtensionAPI) {
         lastFigureAt = 0;
         lastReportedOutput = -1;
         firstDeltaAt = 0;
+        msgChars = 0;
+        msgDeltas = 0;
+        estCharsTotal = 0;
+        estDeltaTotal = 0;
+        estCarry = 0;
+        usedReported = false;
         streamingMessage = true;
         startDisplayTick();
         messageStartTime = Date.now();
@@ -220,22 +320,35 @@ export default function (pi: ExtensionAPI) {
         // reports usage only once, at the end, is ignored for the rate so it does not look
         // like one enormous burst, while still making the live context percentage exact.
         const reported = ev.partial?.usage?.output;
+        const text = ev.delta ?? "";
+        msgChars += text.length;
         let tokens = 0;
         if (typeof reported === "number") {
-          if (lastReportedOutput >= 0 && reported > lastReportedOutput) tokens = reported - lastReportedOutput;
+          if (lastReportedOutput >= 0 && reported > lastReportedOutput) {
+            tokens = reported - lastReportedOutput;
+            usedReported = true;
+          }
           lastReportedOutput = reported;
           if (reported > liveStreamedTokens) liveStreamedTokens = reported;
         }
-        if (tokens <= 0) {
-          // No advancing usage report: estimate from the characters in this delta. Counting one
-          // per delta under-reads badly on providers that batch several tokens per delta, which
-          // is typical of local OpenAI-compatible servers. See CHARS_PER_TOKEN_DEFAULT for how
-          // the divisor was measured; the content type does not change it appreciably, so one
-          // divisor covers prose, thinking and tool arguments alike.
-          tokens = Math.max(1, Math.round((ev.delta ?? "").length / CONFIG.charsPerToken));
-          liveStreamedTokens += tokens;
+        // A chunk that carries only a usage report is not a delta: counting it as one would bias
+        // tokens-per-delta on precisely the servers that end with such a chunk.
+        if (text.length > 0) {
+          msgDeltas++;
+          estCharsTotal += text.length / charsPerToken;
+          estDeltaTotal += tokensPerDelta;
         }
-        recordStreamTokens(tokens);
+        if (tokens <= 0 && text.length > 0) {
+          // No advancing usage count for this delta, so the token count has to be estimated. Both
+          // estimators are accumulated so each can be scored at message_end; only the chosen one
+          // feeds the rolling window, carrying the fraction so small deltas accumulate instead of
+          // rounding away.
+          estCarry += useDeltas ? tokensPerDelta : text.length / charsPerToken;
+          tokens = Math.floor(estCarry);
+          estCarry -= tokens;
+          if (typeof reported !== "number") liveStreamedTokens += tokens;
+        }
+        if (tokens > 0 || text.length > 0) recordStreamTokens(tokens);
       }
     });
 
@@ -251,6 +364,24 @@ export default function (pi: ExtensionAPI) {
       const elapsed = Date.now() - spanStart;
       if (output > 0 && elapsed > 400) {
         lastAvgTps = output / (elapsed / 1000);
+      }
+      // Ground truth for the turn just finished. If the provider reported exact counts there is nothing
+      // to learn. Otherwise recalibrate both ratios, score both estimators against the real count, and
+      // hand the next turn to whichever has been closer. A pinned charsPerToken means the user chose the
+      // character estimator, so it is left alone.
+      if (!CONFIG.charsPerTokenPinned && !usedReported && output >= CALIBRATION_MIN_TOKENS
+        && (msgChars >= CALIBRATION_MIN_CHARS || msgDeltas >= CALIBRATION_MIN_DELTAS)) {
+        charsPerToken = calibrateRatio(charsPerToken, msgChars / output, CPT_MIN, CPT_MAX);
+        if (msgDeltas > 0) {
+          tokensPerDelta = calibrateRatio(tokensPerDelta, output / msgDeltas, TPD_MIN, TPD_MAX);
+        }
+        errChars = blendError(errChars, scoreEstimator(estCharsTotal, output));
+        errDeltas = blendError(errDeltas, scoreEstimator(estDeltaTotal, output));
+        if (CONFIG.rateEstimator === "auto") {
+          const d = errDeltas ?? Number.POSITIVE_INFINITY;
+          const c = errChars ?? Number.POSITIVE_INFINITY;
+          useDeltas = useDeltas ? d <= c * ERR_HYSTERESIS : d * ERR_HYSTERESIS <= c;
+        }
       }
       streamingMessage = false;
       stopDisplayTick();
